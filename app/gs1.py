@@ -529,6 +529,28 @@ def _byte_offset(data: str, index: int) -> int:
     return len(data[:index].encode("utf-8"))
 
 
+def _value_byte_offsets(field: str, start_byte: int, limit: int | None) -> list[int]:
+    """UTF-8 byte offsets of ``field``'s characters in a single forward scan.
+
+    ``start_byte`` is the byte offset of ``field[0]`` in the original
+    input; each following offset is accumulated from the previous
+    character's encoded length, so the whole input prefix is never
+    re-encoded.  When ``limit`` is given, at most that many offsets are
+    collected: for a variable-length field ``max_length + 1`` entries
+    suffice to locate the first character beyond the declared maximum,
+    so an over-long field is abandoned as soon as the excess is
+    confirmed instead of being walked to its end.
+    """
+    offsets = []
+    byte = start_byte
+    for index, ch in enumerate(field):
+        if index == limit:
+            break
+        offsets.append(byte)
+        byte += len(ch.encode("utf-8"))
+    return offsets
+
+
 def parse(data: str) -> list[Element]:
     """Parse a GS1 element string or Digital Link URI into ordered elements."""
     if not data:
@@ -549,8 +571,10 @@ def parse(data: str) -> list[Element]:
 def _parse_element_string(data: str) -> list[Element]:
     elements = []
     pos = 0
+    pos_byte = 0  # UTF-8 byte offset of data[pos], advanced incrementally
+    input_end_byte = len(data.encode("utf-8"))  # reported by FIELD_TOO_SHORT
     while pos < len(data):
-        ai_offset = _byte_offset(data, pos)
+        ai_offset = pos_byte
         if data[pos] == GS:
             raise GS1ParseError(
                 "UNEXPECTED_SEPARATOR",
@@ -561,17 +585,27 @@ def _parse_element_string(data: str) -> list[Element]:
             )
         spec, pos = _match_element_string_ai(data, pos, ai_offset)
         value_pos = pos
+        # Matched AI characters are ASCII digits: one byte each.
+        value_byte = ai_offset + spec.ai_length
 
         raw = _read_raw_field(data, pos, spec)
 
-        # UTF-8 byte offset of every value character in the raw input
-        offsets = [_byte_offset(data, value_pos + i) for i in range(len(raw.field))]
+        # UTF-8 byte offset of every value character in the raw input,
+        # collected in one forward scan.  Variable fields stop after
+        # max_length + 1 characters: the offset of the first character
+        # beyond the maximum is all FIELD_TOO_LONG needs, so an
+        # over-long field can no longer force quadratic rescanning.
+        offsets = _value_byte_offsets(
+            raw.field,
+            value_byte,
+            None if spec.fixed_length else spec.max_length + 1,
+        )
         if spec.fixed_length:
-            end_offset = _byte_offset(data, len(data))
+            end_offset = input_end_byte
             sep_index = raw.sep_at - value_pos if raw.sep_at is not None else None
             sep_offset = _byte_offset(data, raw.sep_at) if raw.sep_at is not None else None
         else:
-            end_offset = _byte_offset(data, value_pos)
+            end_offset = value_byte
             sep_index = sep_offset = None
         decimal_value, unit = _validate_value(
             spec,
@@ -594,6 +628,10 @@ def _parse_element_string(data: str) -> list[Element]:
                 unit=unit,
             )
         )
+        # Advance the byte cursor over the consumed value (and any
+        # separator); on paths that reach this point the value is within
+        # its declared length, so the slice is always small.
+        pos_byte = value_byte + len(data[value_pos : raw.new_pos].encode("utf-8"))
         pos = raw.new_pos
     return elements
 
@@ -983,7 +1021,9 @@ def _parse_digital_link(data: str) -> list[Element]:
             )
         seen[ai] = (ai_byte, location)
 
-        value, offsets = _percent_decode(data, val_start, val_end)
+        value, offsets = _percent_decode(
+            data, val_start, val_end, offset_limit=spec.max_length + 1
+        )
         decimal_value, unit = _validate_uri_value(
             spec, value, offsets, _byte_offset(data, val_end)
         )
@@ -1046,15 +1086,27 @@ def _split_query(data, start, end):
     return pairs
 
 
-def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
+def _percent_decode(
+    data: str, start: int, end: int, offset_limit: int | None = None
+) -> tuple[str, list[int]]:
     """Percent-decode ``data[start:end]`` as UTF-8.
 
     Returns the decoded text and, for every decoded character, the raw
-    UTF-8 byte offset of the first byte it came from.
+    UTF-8 byte offset of the first byte it came from.  The scan is a
+    single left-to-right pass: the byte offset of each raw character is
+    accumulated as the cursor advances, never recomputed from the
+    start of the input.
+
+    ``offset_limit`` caps how many per-character offsets are collected
+    (an over-long value only needs the offset of its first character
+    beyond the declared maximum).  The decode itself always runs to
+    ``end`` so that invalid percent-encoding or invalid UTF-8 anywhere
+    in the span is still reported before any length error.
     """
     raw = bytearray()
-    origin = []  # character index in ``data`` where each decoded byte began
+    origin = []  # raw byte offset where each decoded byte began
     i = start
+    byte = _byte_offset(data, start)  # byte offset of data[i]
     while i < end:
         ch = data[i]
         if ch == "%":
@@ -1066,19 +1118,21 @@ def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
             if not hex_ok:
                 raise GS1ParseError(
                     "INVALID_PERCENT_ENCODING",
-                    f"Invalid percent-encoding at byte {_byte_offset(data, i)}: "
+                    f"Invalid percent-encoding at byte {byte}: "
                     f"expected %XX but found {data[i:end]!r}",
-                    offset=_byte_offset(data, i),
+                    offset=byte,
                     expected="percent-encoded UTF-8 byte of the form %XX",
                     found=data[i : min(end, i + 3)],
                 )
             raw.append(int(data[i + 1 : i + 3], 16))
-            origin.append(i)
+            origin.append(byte)
             i += 3
+            byte += 3
         else:
-            for b in ch.encode("utf-8"):
-                raw.append(b)
-                origin.append(i)
+            encoded = ch.encode("utf-8")
+            raw.extend(encoded)
+            origin.extend((byte,) * len(encoded))
+            byte += len(encoded)
             i += 1
 
     try:
@@ -1088,8 +1142,8 @@ def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
         raise GS1ParseError(
             "INVALID_PERCENT_ENCODING",
             "Percent-encoded bytes are not valid UTF-8: "
-            f"0x{raw[exc.start]:02X} at byte {_byte_offset(data, bad)}",
-            offset=_byte_offset(data, bad),
+            f"0x{raw[exc.start]:02X} at byte {bad}",
+            offset=bad,
             expected="valid UTF-8 percent-encoded bytes",
             found=f"0x{raw[exc.start]:02X}",
         ) from None
@@ -1097,7 +1151,9 @@ def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
     offsets = []
     b = 0
     for ch in text:
-        offsets.append(_byte_offset(data, origin[b]))
+        if len(offsets) == offset_limit:
+            break
+        offsets.append(origin[b])
         b += len(ch.encode("utf-8"))
     return text, offsets
 
