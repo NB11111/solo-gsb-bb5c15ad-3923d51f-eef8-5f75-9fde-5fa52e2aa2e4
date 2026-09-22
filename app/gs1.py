@@ -46,6 +46,7 @@ Two input forms are accepted by :func:`parse`:
 from __future__ import annotations
 
 import calendar
+import codecs
 from dataclasses import dataclass
 from decimal import Decimal
 from types import MappingProxyType
@@ -525,8 +526,71 @@ class Element:
 
 
 def _byte_offset(data: str, index: int) -> int:
-    """Byte offset (UTF-8) of the character at ``index``."""
+    """Byte offset (UTF-8) of the character at ``index``.
+
+    Only used for isolated offsets (error locations, span boundaries);
+    per-character offsets of a value are accumulated incrementally by the
+    field readers instead, so parsing long values stays linear.
+    """
     return len(data[:index].encode("utf-8"))
+
+
+def _char_utf8_length(ch: str) -> int:
+    """UTF-8 byte length of a single already-decoded character (1-4)."""
+    codepoint = ord(ch)
+    if codepoint < 0x80:
+        return 1
+    if codepoint < 0x800:
+        return 2
+    if codepoint < 0x10000:
+        return 3
+    return 4
+
+
+@dataclass(frozen=True)
+class _ValueScan:
+    """Variable-length field gathered in a single linear scan.
+
+    ``offsets[i]`` is the raw UTF-8 byte offset of ``field[i]``; both lists
+    grow only up to the field's maximum allowed length plus one, so an
+    overlong field is detected while scanning its first illegal character
+    without ever touching the remainder of the input.
+    """
+
+    field: str
+    offsets: tuple[int, ...]
+    terminated: bool
+    overlong: bool  # scanning stopped on character max_length + 1
+
+
+def _scan_variable_field(data: str, pos: int, spec, byte_pos: int) -> _ValueScan:
+    """Read a variable-length element-string value in one linear scan.
+
+    ``pos`` is the character index where the value starts and ``byte_pos``
+    its UTF-8 byte offset. The scan stops as soon as ``max_length + 1``
+    characters have been seen, so the caller can report FIELD_TOO_LONG
+    against that 21st character; the trailing input (separator or more
+    characters) is never inspected.
+    """
+    chars: list[str] = []
+    offsets: list[int] = []
+    i = pos
+    n_data = len(data)
+    while i < n_data:
+        ch = data[i]
+        if ch == GS:
+            return _ValueScan("".join(chars), tuple(offsets), True, False)
+        if len(chars) == spec.max_length:
+            # This is character max_length + 1: record only its first-byte
+            # offset, then stop scanning immediately.
+            offsets.append(byte_pos)
+            chars.append(ch)
+            return _ValueScan("".join(chars), tuple(offsets), False, True)
+        chars.append(ch)
+        offsets.append(byte_pos)
+        byte_pos += _char_utf8_length(ch)
+        i += 1
+    return _ValueScan("".join(chars), tuple(offsets), False, False)
 
 
 def parse(data: str) -> list[Element]:
@@ -549,8 +613,10 @@ def parse(data: str) -> list[Element]:
 def _parse_element_string(data: str) -> list[Element]:
     elements = []
     pos = 0
+    byte_pos = 0  # UTF-8 byte offset of data[pos], maintained incrementally
+    total_bytes = len(data.encode("utf-8"))
     while pos < len(data):
-        ai_offset = _byte_offset(data, pos)
+        ai_offset = byte_pos
         if data[pos] == GS:
             raise GS1ParseError(
                 "UNEXPECTED_SEPARATOR",
@@ -560,42 +626,112 @@ def _parse_element_string(data: str) -> list[Element]:
                 found="<GS>",
             )
         spec, pos = _match_element_string_ai(data, pos, ai_offset)
+        # Recognised AIs are ASCII digits, so every AI character is one byte.
+        byte_pos = ai_offset + spec.ai_length
         value_pos = pos
 
-        raw = _read_raw_field(data, pos, spec)
-
-        # UTF-8 byte offset of every value character in the raw input
-        offsets = [_byte_offset(data, value_pos + i) for i in range(len(raw.field))]
         if spec.fixed_length:
-            end_offset = _byte_offset(data, len(data))
-            sep_index = raw.sep_at - value_pos if raw.sep_at is not None else None
-            sep_offset = _byte_offset(data, raw.sep_at) if raw.sep_at is not None else None
+            field, offsets, pos, byte_pos = _read_fixed_field(
+                data, pos, spec, byte_pos
+            )
+            # A separator embedded inside the fixed field is the field's end.
+            sep_index = None
+            sep_offset = None
+            slice_end = min(value_pos + spec.max_length, len(data))
+            end = data.find(GS, value_pos, slice_end)
+            if end != -1:
+                sep_index = end - value_pos
+                sep_offset = _byte_offset(data, end)
+                end_offset = sep_offset
+            else:
+                end_offset = total_bytes
+            decimal_value, unit = _validate_value(
+                spec,
+                field,
+                offsets,
+                "element_string",
+                end_offset=end_offset,
+                sep_index=sep_index,
+                sep_offset=sep_offset,
+            )
         else:
-            end_offset = _byte_offset(data, value_pos)
-            sep_index = sep_offset = None
-        decimal_value, unit = _validate_value(
-            spec,
-            raw.field,
-            offsets,
-            "element_string",
-            end_offset=end_offset,
-            sep_index=sep_index,
-            sep_offset=sep_offset,
-            terminated=raw.terminated,
-        )
+            scan = _scan_variable_field(data, pos, spec, byte_pos)
+            field = scan.field
+            offsets = scan.offsets
+            if scan.overlong:
+                # The scan stopped on character max_length + 1 without
+                # reading any further input. Locate the terminator in the
+                # unread tail (C-level find, no per-character work) only to
+                # preserve the original error wording.
+                tail_sep = data.find(GS, pos + spec.max_length + 1)
+                if tail_sep == -1:
+                    actual_length = len(data) - value_pos
+                    terminated = False
+                else:
+                    actual_length = tail_sep - value_pos
+                    terminated = True
+                end_offset = byte_pos
+                decimal_value, unit = _validate_value(
+                    spec,
+                    field,
+                    offsets,
+                    "element_string",
+                    end_offset=end_offset,
+                    terminated=terminated,
+                    actual_length=actual_length,
+                )
+            else:
+                # FIELD_EMPTY reports the start of the (empty) value.
+                end_offset = byte_pos
+                value_bytes = len(field.encode("utf-8"))
+                if scan.terminated:
+                    pos = pos + len(field) + 1
+                    byte_pos = byte_pos + value_bytes + 1
+                else:
+                    pos = pos + len(field)
+                    byte_pos = byte_pos + value_bytes
+                decimal_value, unit = _validate_value(
+                    spec,
+                    field,
+                    offsets,
+                    "element_string",
+                    end_offset=end_offset,
+                    terminated=scan.terminated,
+                )
 
         elements.append(
             Element(
                 ai=spec.ai,
                 name=spec.name,
-                value=raw.field,
+                value=field,
                 offset=ai_offset,
                 decimal_value=decimal_value,
                 unit=unit,
             )
         )
-        pos = raw.new_pos
     return elements
+
+
+def _read_fixed_field(data, pos, spec, byte_pos):
+    """Read a fixed-length value, accumulating per-character byte offsets.
+
+    A separator inside the field truncates it (the length check reports
+    FIELD_TOO_SHORT). Returns ``(field, offsets, new_pos, new_byte_pos)``.
+    """
+    chars: list[str] = []
+    offsets: list[int] = []
+    i = pos
+    n_data = len(data)
+    end = min(pos + spec.max_length, n_data)
+    while i < end:
+        ch = data[i]
+        if ch == GS:
+            return "".join(chars), offsets, i + 1, byte_pos + 1
+        chars.append(ch)
+        offsets.append(byte_pos)
+        byte_pos += _char_utf8_length(ch)
+        i += 1
+    return "".join(chars), offsets, end, byte_pos
 
 
 def _match_element_string_ai(data: str, pos: int, ai_offset: int):
@@ -661,36 +797,6 @@ def _match_element_string_ai(data: str, pos: int, ai_offset: int):
     return spec, pos + spec.ai_length
 
 
-@dataclass(frozen=True)
-class _RawField:
-    """Raw value slice produced by the element-string reader."""
-
-    field: str
-    new_pos: int
-    sep_at: int | None  # data index of a separator inside a fixed field
-    terminated: bool  # variable field: whether a GS delimiter was found
-
-
-def _read_raw_field(data, pos, spec) -> _RawField:
-    """Slice the raw value of one element without raising length errors.
-
-    Length validation is centralised in :func:`_validate_value` so both
-    carriers share it.
-    """
-    if spec.fixed_length:
-        field = data[pos : pos + spec.max_length]
-        sep = field.find(GS)
-        if sep != -1:
-            return _RawField(field[:sep], pos + sep + 1, pos + sep, False)
-        return _RawField(field, pos + len(field), None, False)
-
-    end = data.find(GS, pos)
-    terminated = end != -1
-    if not terminated:
-        end = len(data)
-    return _RawField(data[pos:end], end + 1 if terminated else end, None, terminated)
-
-
 # ------------------------------------------------------------ shared value checks
 
 
@@ -704,14 +810,22 @@ def _validate_value(
     sep_index=None,
     sep_offset=None,
     terminated=False,
+    actual_length=None,
+    truncated=False,
 ):
     """Length, charset and semantic checks shared by both input carriers.
 
     ``carrier`` is ``"element_string"`` or ``"digital_link"``; only the
     wording/location of length errors differs between them.
     ``offsets[i]`` is the raw byte offset of ``value[i]``.
+
+    ``actual_length`` is the true number of decoded characters when a
+    field was cut short by the single-pass scan (``value`` then contains
+    only ``max_length + 1`` characters); ``truncated`` marks a Digital
+    Link value whose tail was not scanned at all, in which case only a
+    lower bound on the length is known.
     """
-    n = len(value)
+    n = actual_length if actual_length is not None else len(value)
     if spec.fixed_length:
         if n == spec.max_length:
             pass
@@ -743,6 +857,15 @@ def _validate_value(
                 found=f"{n} character(s)",
             )
         else:
+            if truncated:
+                raise GS1ParseError(
+                    "FIELD_TOO_LONG",
+                    f"AI {spec.ai} ({spec.name}) requires exactly {spec.max_length} characters "
+                    f"but more than {spec.max_length} were found after percent-decoding",
+                    offset=offsets[spec.max_length],
+                    expected=f"{spec.max_length} characters for AI {spec.ai}",
+                    found=f"more than {spec.max_length} characters",
+                )
             raise GS1ParseError(
                 "FIELD_TOO_LONG",
                 f"AI {spec.ai} ({spec.name}) requires exactly {spec.max_length} characters "
@@ -768,6 +891,15 @@ def _validate_value(
                     f"but got {n} before {'the separator' if terminated else 'end of input'}",
                     offset=offsets[spec.max_length],
                     expected=f"separator (ASCII 29) or end of input within {spec.max_length} characters",
+                )
+            if truncated:
+                raise GS1ParseError(
+                    "FIELD_TOO_LONG",
+                    f"AI {spec.ai} ({spec.name}) allows at most {spec.max_length} characters "
+                    f"but more than {spec.max_length} were found after percent-decoding",
+                    offset=offsets[spec.max_length],
+                    expected=f"at most {spec.max_length} characters for AI {spec.ai}",
+                    found=f"more than {spec.max_length} characters",
                 )
             raise GS1ParseError(
                 "FIELD_TOO_LONG",
@@ -904,7 +1036,9 @@ def _parse_digital_link(data: str) -> list[Element]:
     def consume(ai_span, value_span, location):
         ai_start, ai_end = ai_span
         val_start, val_end = value_span
-        ai, ai_offsets = _percent_decode(data, ai_start, ai_end)
+        decoded_ai = _percent_decode(data, ai_start, ai_end)
+        ai = decoded_ai.text
+        ai_offsets = decoded_ai.offsets
         ai_byte = ai_offsets[0] if ai_offsets else _byte_offset(data, ai_start)
 
         # In a URI the AI is the whole path segment / query key; the same
@@ -983,15 +1117,20 @@ def _parse_digital_link(data: str) -> list[Element]:
             )
         seen[ai] = (ai_byte, location)
 
-        value, offsets = _percent_decode(data, val_start, val_end)
+        decoded = _percent_decode(data, val_start, val_end, spec.max_length)
+        end_offset = _byte_offset(data, val_end)
         decimal_value, unit = _validate_uri_value(
-            spec, value, offsets, _byte_offset(data, val_end)
+            spec,
+            decoded.text,
+            decoded.offsets,
+            end_offset,
+            truncated=decoded.overlong,
         )
         elements.append(
             Element(
                 ai=spec.ai,
                 name=spec.name,
-                value=value,
+                value=decoded.text,
                 offset=ai_byte,
                 decimal_value=decimal_value,
                 unit=unit,
@@ -1046,14 +1185,78 @@ def _split_query(data, start, end):
     return pairs
 
 
-def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
-    """Percent-decode ``data[start:end]`` as UTF-8.
+@dataclass(frozen=True)
+class _Decoded:
+    """Result of the streaming percent-decoder.
 
-    Returns the decoded text and, for every decoded character, the raw
-    UTF-8 byte offset of the first byte it came from.
+    ``offsets[i]`` is the raw UTF-8 byte offset of the first raw byte of
+    ``text[i]``. When the decoded text exceeds ``max_chars`` characters
+    ``overlong`` is set and ``text``/``offsets`` hold exactly
+    ``max_chars + 1`` entries -- the 21st character is enough to report
+    FIELD_TOO_LONG, and the unread remainder of the span is never touched.
     """
-    raw = bytearray()
-    origin = []  # character index in ``data`` where each decoded byte began
+
+    text: str
+    offsets: tuple[int, ...]
+    overlong: bool = False
+
+
+def _percent_decode(
+    data: str, start: int, end: int, max_chars: int | None = None
+) -> _Decoded:
+    """Percent-decode ``data[start:end]`` as UTF-8 in a single linear pass.
+
+    Bytes are fed to an incremental UTF-8 decoder as they are read. Error
+    precedence matches the historical assemble-then-decode behaviour: a
+    malformed ``%`` escape anywhere in the span outranks an invalid-UTF-8
+    failure, so a UTF-8 failure is recorded and the scan continues
+    (syntax-checking only) until the end of the span; with no syntax
+    error the recorded UTF-8 failure is reported. For every completed
+    decoded character the raw UTF-8 byte offset of its first source byte
+    is recorded immediately; offsets are never recomputed over the prefix.
+
+    When ``max_chars`` is given the scan stops as soon as character
+    ``max_chars + 1`` completes, returning it via :class:`_Decoded`
+    without inspecting the rest of the span.
+    """
+    decoder = codecs.getincrementaldecoder("utf-8")()
+
+    chars: list[str] = []
+    offsets: list[int] = []
+    raw_byte_pos = _byte_offset(data, start)  # raw UTF-8 bytes before the span cursor
+    # Origin (raw byte offset) of the first byte of the multibyte sequence
+    # currently buffered inside the incremental decoder, if any.
+    pending_offset: int | None = None
+    # First invalid-UTF-8 failure as (raw byte offset, offending byte),
+    # deferred until the whole span was syntax-checked.
+    utf8_error: tuple[int, int] | None = None
+    decoding = True
+
+    def decode_chunk(chunk: bytes, chunk_offset: int):
+        """Feed one assembled byte group; emit every character it completes."""
+        nonlocal pending_offset, decoding, utf8_error
+        try:
+            out = decoder.decode(chunk)
+        except UnicodeDecodeError as exc:
+            # With a pending buffer the exception object is buffer + chunk,
+            # so its first byte is the pending sequence's first byte; the
+            # only way a chunk fails with an empty buffer is at its own
+            # first byte.
+            if utf8_error is None:
+                bad_offset = (
+                    pending_offset if pending_offset is not None else chunk_offset
+                )
+                utf8_error = (bad_offset, (decoder.buffer + chunk)[exc.start])
+            decoding = False  # decoder state is spent; only syntax is checked
+            return
+        if out:
+            origin = pending_offset if pending_offset is not None else chunk_offset
+            for _ch in out:
+                chars.append(_ch)
+                offsets.append(origin)
+            # A chunk that completes a character never leaves bytes pending.
+            pending_offset = None
+
     i = start
     while i < end:
         ch = data[i]
@@ -1066,44 +1269,65 @@ def _percent_decode(data: str, start: int, end: int) -> tuple[str, list[int]]:
             if not hex_ok:
                 raise GS1ParseError(
                     "INVALID_PERCENT_ENCODING",
-                    f"Invalid percent-encoding at byte {_byte_offset(data, i)}: "
+                    f"Invalid percent-encoding at byte {raw_byte_pos}: "
                     f"expected %XX but found {data[i:end]!r}",
-                    offset=_byte_offset(data, i),
+                    offset=raw_byte_pos,
                     expected="percent-encoded UTF-8 byte of the form %XX",
                     found=data[i : min(end, i + 3)],
                 )
-            raw.append(int(data[i + 1 : i + 3], 16))
-            origin.append(i)
+            if decoding:
+                if pending_offset is None:
+                    pending_offset = raw_byte_pos
+                decode_chunk(bytes([int(data[i + 1 : i + 3], 16)]), raw_byte_pos)
+            raw_byte_pos += 3
             i += 3
         else:
-            for b in ch.encode("utf-8"):
-                raw.append(b)
-                origin.append(i)
+            encoded = ch.encode("utf-8")
+            if decoding:
+                decode_chunk(encoded, raw_byte_pos)
+            raw_byte_pos += len(encoded)
             i += 1
+        if decoding and max_chars is not None and len(chars) > max_chars and i < end:
+            # More raw input remains beyond character max_chars + 1: stop
+            # the scan here without inspecting it. A span consumed exactly
+            # at the limit falls through and is reported with its exact
+            # length, as before.
+            return _Decoded("".join(chars), tuple(offsets), overlong=True)
 
-    try:
-        text = raw.decode("utf-8")
-    except UnicodeDecodeError as exc:
-        bad = origin[exc.start]
+    if utf8_error is not None:
+        bad_offset, bad_byte = utf8_error
         raise GS1ParseError(
             "INVALID_PERCENT_ENCODING",
             "Percent-encoded bytes are not valid UTF-8: "
-            f"0x{raw[exc.start]:02X} at byte {_byte_offset(data, bad)}",
-            offset=_byte_offset(data, bad),
+            f"0x{bad_byte:02X} at byte {bad_offset}",
+            offset=bad_offset,
             expected="valid UTF-8 percent-encoded bytes",
-            found=f"0x{raw[exc.start]:02X}",
+            found=f"0x{bad_byte:02X}",
         ) from None
 
-    offsets = []
-    b = 0
-    for ch in text:
-        offsets.append(_byte_offset(data, origin[b]))
-        b += len(ch.encode("utf-8"))
-    return text, offsets
+    # Flush: a dangling multibyte sequence at the end of the span is invalid.
+    if decoder.buffer:
+        bad_offset = pending_offset if pending_offset is not None else raw_byte_pos
+        bad_byte = decoder.buffer[0]
+        raise GS1ParseError(
+            "INVALID_PERCENT_ENCODING",
+            "Percent-encoded bytes are not valid UTF-8: "
+            f"0x{bad_byte:02X} at byte {bad_offset}",
+            offset=bad_offset,
+            expected="valid UTF-8 percent-encoded bytes",
+            found=f"0x{bad_byte:02X}",
+        ) from None
+
+    return _Decoded("".join(chars), tuple(offsets))
 
 
-def _validate_uri_value(spec, value, offsets, end_offset):
+def _validate_uri_value(spec, value, offsets, end_offset, truncated=False):
     """Shared dispatch entry for a percent-decoded URI value."""
     return _validate_value(
-        spec, value, offsets, "digital_link", end_offset=end_offset
+        spec,
+        value,
+        offsets,
+        "digital_link",
+        end_offset=end_offset,
+        truncated=truncated,
     )
